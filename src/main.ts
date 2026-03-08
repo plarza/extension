@@ -3,7 +3,7 @@ try {
 		throw new Error("Running in iframe");
 	}
 } catch {
-	throw new Error("Blocked");
+	throw new Error("Running in iframe or cross-origin frame");
 }
 
 if ((window as any).__plarzaScraperInitialized) {
@@ -19,6 +19,7 @@ const CONFIG = Object.freeze({
 	REQUEST_TIMEOUT_MS: 15_000,
 	API_KEY_PROMPT_COOLDOWN_MS: 60_000,
 	MASTER_LIST_MAX_SIZE: 10_000,
+	PENDING_LIST_MAX_SIZE: 5_000,
 	STORAGE_KEYS: Object.freeze({
 		pending: "plarza_pending_urls",
 		master: "plarza_submitted_urls",
@@ -128,39 +129,30 @@ function writeSet(key: string, set: Set<string>): boolean {
 	return safeSetValue(key, JSON.stringify([...set]));
 }
 
-function flushPendingUrls() {
-	if (state.pendingPersistTimerId !== null) {
-		clearTimeout(state.pendingPersistTimerId);
-		state.pendingPersistTimerId = null;
+type PersistTarget = "pending" | "master";
+
+const PERSIST_MAP: Record<PersistTarget, { timerKey: "pendingPersistTimerId" | "masterPersistTimerId"; storageKey: string; getSet: () => Set<string> }> = {
+	pending: { timerKey: "pendingPersistTimerId", storageKey: CONFIG.STORAGE_KEYS.pending, getSet: () => state.pendingUrls },
+	master: { timerKey: "masterPersistTimerId", storageKey: CONFIG.STORAGE_KEYS.master, getSet: () => state.masterUrls },
+};
+
+function flushSet(target: PersistTarget) {
+	const { timerKey, storageKey, getSet } = PERSIST_MAP[target];
+	if (state[timerKey] !== null) {
+		clearTimeout(state[timerKey]!);
+		state[timerKey] = null;
 	}
-	writeSet(CONFIG.STORAGE_KEYS.pending, state.pendingUrls);
+	writeSet(storageKey, getSet());
 }
 
-function flushMasterUrls() {
-	if (state.masterPersistTimerId !== null) {
-		clearTimeout(state.masterPersistTimerId);
-		state.masterPersistTimerId = null;
+function scheduleSetSave(target: PersistTarget) {
+	const { timerKey, storageKey, getSet } = PERSIST_MAP[target];
+	if (state[timerKey] !== null) {
+		clearTimeout(state[timerKey]!);
 	}
-	writeSet(CONFIG.STORAGE_KEYS.master, state.masterUrls);
-}
-
-function schedulePendingUrlsSave() {
-	if (state.pendingPersistTimerId !== null) {
-		clearTimeout(state.pendingPersistTimerId);
-	}
-	state.pendingPersistTimerId = window.setTimeout(() => {
-		state.pendingPersistTimerId = null;
-		writeSet(CONFIG.STORAGE_KEYS.pending, state.pendingUrls);
-	}, CONFIG.PERSIST_DEBOUNCE_MS);
-}
-
-function scheduleMasterUrlsSave() {
-	if (state.masterPersistTimerId !== null) {
-		clearTimeout(state.masterPersistTimerId);
-	}
-	state.masterPersistTimerId = window.setTimeout(() => {
-		state.masterPersistTimerId = null;
-		writeSet(CONFIG.STORAGE_KEYS.master, state.masterUrls);
+	state[timerKey] = window.setTimeout(() => {
+		state[timerKey] = null;
+		writeSet(storageKey, getSet());
 	}, CONFIG.PERSIST_DEBOUNCE_MS);
 }
 
@@ -264,9 +256,12 @@ function addUrl(url: string): boolean {
 	if (state.pendingUrls.has(candidate) || state.masterUrls.has(candidate)) {
 		return false;
 	}
+	if (state.pendingUrls.size >= CONFIG.PENDING_LIST_MAX_SIZE) {
+		return false;
+	}
 
 	state.pendingUrls.add(candidate);
-	schedulePendingUrlsSave();
+	scheduleSetSave("pending");
 	return true;
 }
 
@@ -354,15 +349,17 @@ function scanScripts(): number {
 	return added;
 }
 
+const DATA_URL_SELECTORS = [
+	"[data-src]", "[data-href]", "[data-url]", "[data-video-url]",
+	"[data-image]", "[data-poster]", "[data-background]", "[data-original]",
+].join(",");
+
 function scanDataAttributes(): number {
 	let added = 0;
-	for (const element of safeQueryAll("*")) {
+	for (const element of safeQueryAll(DATA_URL_SELECTORS)) {
 		try {
-			if (!element.attributes || element.attributes.length === 0) {
-				continue;
-			}
 			for (const attr of element.attributes) {
-				if (attr && attr.name && attr.name.startsWith("data-")) {
+				if (attr.name.startsWith("data-")) {
 					added += addUrlsFromText(attr.value);
 				}
 			}
@@ -375,7 +372,7 @@ function scanDataAttributes(): number {
 
 function scanBodyText(): number {
 	try {
-		return addUrlsFromText(document.body ? document.body.innerText : "");
+		return addUrlsFromText(document.body ? document.body.textContent : "");
 	} catch (error) {
 		log("warn", "Failed scanning page text", error);
 		return 0;
@@ -437,9 +434,9 @@ function scheduleScan(reason = "mutation", delayMs: number = CONFIG.SCAN_DEBOUNC
 	}, Math.max(0, delayMs));
 }
 
-function enforceMasterListLimit() {
+function enforceMasterListLimit(): boolean {
 	if (state.masterUrls.size <= CONFIG.MASTER_LIST_MAX_SIZE) {
-		return;
+		return false;
 	}
 
 	let removed = 0;
@@ -455,6 +452,7 @@ function enforceMasterListLimit() {
 	if (removed > 0) {
 		log("muted", `Trimmed ${removed} old URL${removed === 1 ? "" : "s"} from master list`);
 	}
+	return removed > 0;
 }
 
 function addToMasterList(urls: string[]) {
@@ -474,7 +472,7 @@ function addToMasterList(urls: string[]) {
 	}
 
 	enforceMasterListLimit();
-	scheduleMasterUrlsSave();
+	scheduleSetSave("master");
 }
 
 function removeFromPendingList(urls: string[]): number {
@@ -485,7 +483,7 @@ function removeFromPendingList(urls: string[]): number {
 		}
 	}
 	if (removed > 0) {
-		schedulePendingUrlsSave();
+		scheduleSetSave("pending");
 	}
 	return removed;
 }
@@ -499,7 +497,7 @@ function parseJson(text: string): unknown {
 }
 
 interface SubmitResult {
-	parsed: any;
+	parsed: Record<string, unknown>;
 	message: string;
 	total: number;
 	success: number | null;
@@ -510,27 +508,36 @@ interface SubmitResult {
 	fullyAccounted: boolean;
 }
 
+function getNum(obj: Record<string, unknown>, key: string): number | undefined {
+	const v = obj[key];
+	return typeof v === "number" ? v : undefined;
+}
+
+function getStr(obj: Record<string, unknown>, key: string): string | undefined {
+	const v = obj[key];
+	return typeof v === "string" ? v : undefined;
+}
+
 function parseSubmitResult(responseText: string, fallbackTotal: number): SubmitResult | null {
 	const parsed = parseJson(responseText);
 	if (!parsed || typeof parsed !== "object") {
 		return null;
 	}
 
-	const details = (parsed as any).details && typeof (parsed as any).details === "object" ? (parsed as any).details : parsed;
-	if (!details || typeof details !== "object") {
-		return null;
-	}
+	const obj = parsed as Record<string, unknown>;
+	const rawDetails = obj.details;
+	const details = (rawDetails && typeof rawDetails === "object" ? rawDetails : obj) as Record<string, unknown>;
 
-	const total = typeof details.total === "number" ? details.total : fallbackTotal;
-	const success = typeof details.success === "number" ? details.success : null;
-	const duplicate = typeof details.duplicate === "number" ? details.duplicate : 0;
-	const blocked = typeof details.blocked === "number" ? details.blocked : 0;
-	const invalid = typeof details.invalid === "number" ? details.invalid : 0;
+	const total = getNum(details, "total") ?? fallbackTotal;
+	const success = getNum(details, "success") ?? null;
+	const duplicate = getNum(details, "duplicate") ?? 0;
+	const blocked = getNum(details, "blocked") ?? 0;
+	const invalid = getNum(details, "invalid") ?? 0;
 	const accounted = typeof success === "number" ? success + duplicate + blocked + invalid : null;
-	const message = typeof (parsed as any).message === "string" ? (parsed as any).message : "Submit response received";
+	const message = getStr(obj, "message") ?? "Submit response received";
 
 	return {
-		parsed,
+		parsed: obj,
 		message,
 		total,
 		success,
@@ -542,16 +549,11 @@ function parseSubmitResult(responseText: string, fallbackTotal: number): SubmitR
 	};
 }
 
-function extractResponseErrorBody(response: Tampermonkey.Response<any>): string {
+function extractResponseErrorBody(response: Tampermonkey.Response<object>): string {
 	const parsed = parseJson(response.responseText);
 	if (parsed && typeof parsed === "object") {
-		if (typeof (parsed as any).error === "string") {
-			return (parsed as any).error;
-		}
-		if (typeof (parsed as any).message === "string") {
-			return (parsed as any).message;
-		}
-		return JSON.stringify(parsed);
+		const obj = parsed as Record<string, unknown>;
+		return getStr(obj, "error") ?? getStr(obj, "message") ?? JSON.stringify(parsed);
 	}
 	return response.responseText || "";
 }
@@ -575,10 +577,6 @@ function submitUrls() {
 	}
 
 	const urlsToSubmit = [...state.pendingUrls];
-	if (urlsToSubmit.length === 0) {
-		return;
-	}
-
 	state.submitInFlight = true;
 	logGroup(`Submitting ${urlsToSubmit.length} URLs...`, urlsToSubmit);
 
@@ -699,8 +697,8 @@ function observePageChanges() {
 }
 
 function flushAllStorageWrites() {
-	flushPendingUrls();
-	flushMasterUrls();
+	flushSet("pending");
+	flushSet("master");
 }
 
 function getStatus() {
@@ -716,9 +714,8 @@ function getStatus() {
 function initState() {
 	state.pendingUrls = readStringSet(CONFIG.STORAGE_KEYS.pending);
 	state.masterUrls = readStringSet(CONFIG.STORAGE_KEYS.master);
-	enforceMasterListLimit();
-	if (state.masterUrls.size > 0) {
-		scheduleMasterUrlsSave();
+	if (enforceMasterListLimit()) {
+		scheduleSetSave("master");
 	}
 }
 
