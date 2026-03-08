@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plarza Extension
 // @namespace    https://plarza.com
-// @version      1.0.0
+// @version      1.1.0
 // @author       Plarza
 // @description  Scans web pages for URLs and uploads them to Plarza
 // @icon         https://plarza.com/favicon.svg
@@ -26,7 +26,7 @@
       throw new Error("Running in iframe");
     }
   } catch {
-    throw new Error("Blocked");
+    throw new Error("Running in iframe or cross-origin frame");
   }
   if (window.__plarzaScraperInitialized) {
     throw new Error("Already initialized");
@@ -40,6 +40,7 @@
     REQUEST_TIMEOUT_MS: 15e3,
     API_KEY_PROMPT_COOLDOWN_MS: 6e4,
     MASTER_LIST_MAX_SIZE: 1e4,
+    PENDING_LIST_MAX_SIZE: 5e3,
     STORAGE_KEYS: Object.freeze({
       pending: "plarza_pending_urls",
       master: "plarza_submitted_urls",
@@ -122,36 +123,26 @@
   function writeSet(key, set) {
     return safeSetValue(key, JSON.stringify([...set]));
   }
-  function flushPendingUrls() {
-    if (state.pendingPersistTimerId !== null) {
-      clearTimeout(state.pendingPersistTimerId);
-      state.pendingPersistTimerId = null;
+  const PERSIST_MAP = {
+    pending: { timerKey: "pendingPersistTimerId", storageKey: CONFIG.STORAGE_KEYS.pending, getSet: () => state.pendingUrls },
+    master: { timerKey: "masterPersistTimerId", storageKey: CONFIG.STORAGE_KEYS.master, getSet: () => state.masterUrls }
+  };
+  function flushSet(target) {
+    const { timerKey, storageKey, getSet } = PERSIST_MAP[target];
+    if (state[timerKey] !== null) {
+      clearTimeout(state[timerKey]);
+      state[timerKey] = null;
     }
-    writeSet(CONFIG.STORAGE_KEYS.pending, state.pendingUrls);
+    writeSet(storageKey, getSet());
   }
-  function flushMasterUrls() {
-    if (state.masterPersistTimerId !== null) {
-      clearTimeout(state.masterPersistTimerId);
-      state.masterPersistTimerId = null;
+  function scheduleSetSave(target) {
+    const { timerKey, storageKey, getSet } = PERSIST_MAP[target];
+    if (state[timerKey] !== null) {
+      clearTimeout(state[timerKey]);
     }
-    writeSet(CONFIG.STORAGE_KEYS.master, state.masterUrls);
-  }
-  function schedulePendingUrlsSave() {
-    if (state.pendingPersistTimerId !== null) {
-      clearTimeout(state.pendingPersistTimerId);
-    }
-    state.pendingPersistTimerId = window.setTimeout(() => {
-      state.pendingPersistTimerId = null;
-      writeSet(CONFIG.STORAGE_KEYS.pending, state.pendingUrls);
-    }, CONFIG.PERSIST_DEBOUNCE_MS);
-  }
-  function scheduleMasterUrlsSave() {
-    if (state.masterPersistTimerId !== null) {
-      clearTimeout(state.masterPersistTimerId);
-    }
-    state.masterPersistTimerId = window.setTimeout(() => {
-      state.masterPersistTimerId = null;
-      writeSet(CONFIG.STORAGE_KEYS.master, state.masterUrls);
+    state[timerKey] = window.setTimeout(() => {
+      state[timerKey] = null;
+      writeSet(storageKey, getSet());
     }, CONFIG.PERSIST_DEBOUNCE_MS);
   }
   function normalizeApiKey(apiKey) {
@@ -237,8 +228,11 @@
     if (state.pendingUrls.has(candidate) || state.masterUrls.has(candidate)) {
       return false;
     }
+    if (state.pendingUrls.size >= CONFIG.PENDING_LIST_MAX_SIZE) {
+      return false;
+    }
     state.pendingUrls.add(candidate);
-    schedulePendingUrlsSave();
+    scheduleSetSave("pending");
     return true;
   }
   function addUrlsFromText(text) {
@@ -315,15 +309,22 @@
     }
     return added;
   }
+  const DATA_URL_SELECTORS = [
+    "[data-src]",
+    "[data-href]",
+    "[data-url]",
+    "[data-video-url]",
+    "[data-image]",
+    "[data-poster]",
+    "[data-background]",
+    "[data-original]"
+  ].join(",");
   function scanDataAttributes() {
     let added = 0;
-    for (const element of safeQueryAll("*")) {
+    for (const element of safeQueryAll(DATA_URL_SELECTORS)) {
       try {
-        if (!element.attributes || element.attributes.length === 0) {
-          continue;
-        }
         for (const attr of element.attributes) {
-          if (attr && attr.name && attr.name.startsWith("data-")) {
+          if (attr.name.startsWith("data-")) {
             added += addUrlsFromText(attr.value);
           }
         }
@@ -335,7 +336,7 @@
   }
   function scanBodyText() {
     try {
-      return addUrlsFromText(document.body ? document.body.innerText : "");
+      return addUrlsFromText(document.body ? document.body.textContent : "");
     } catch (error) {
       log("warn", "Failed scanning page text", error);
       return 0;
@@ -389,7 +390,7 @@
   }
   function enforceMasterListLimit() {
     if (state.masterUrls.size <= CONFIG.MASTER_LIST_MAX_SIZE) {
-      return;
+      return false;
     }
     let removed = 0;
     while (state.masterUrls.size > CONFIG.MASTER_LIST_MAX_SIZE) {
@@ -403,6 +404,7 @@
     if (removed > 0) {
       log("muted", `Trimmed ${removed} old URL${removed === 1 ? "" : "s"} from master list`);
     }
+    return removed > 0;
   }
   function addToMasterList(urls) {
     let changed = false;
@@ -419,7 +421,7 @@
       return;
     }
     enforceMasterListLimit();
-    scheduleMasterUrlsSave();
+    scheduleSetSave("master");
   }
   function removeFromPendingList(urls) {
     let removed = 0;
@@ -429,7 +431,7 @@
       }
     }
     if (removed > 0) {
-      schedulePendingUrlsSave();
+      scheduleSetSave("pending");
     }
     return removed;
   }
@@ -440,24 +442,31 @@
       return null;
     }
   }
+  function getNum(obj, key) {
+    const v = obj[key];
+    return typeof v === "number" ? v : void 0;
+  }
+  function getStr(obj, key) {
+    const v = obj[key];
+    return typeof v === "string" ? v : void 0;
+  }
   function parseSubmitResult(responseText, fallbackTotal) {
     const parsed = parseJson(responseText);
     if (!parsed || typeof parsed !== "object") {
       return null;
     }
-    const details = parsed.details && typeof parsed.details === "object" ? parsed.details : parsed;
-    if (!details || typeof details !== "object") {
-      return null;
-    }
-    const total = typeof details.total === "number" ? details.total : fallbackTotal;
-    const success = typeof details.success === "number" ? details.success : null;
-    const duplicate = typeof details.duplicate === "number" ? details.duplicate : 0;
-    const blocked = typeof details.blocked === "number" ? details.blocked : 0;
-    const invalid = typeof details.invalid === "number" ? details.invalid : 0;
+    const obj = parsed;
+    const rawDetails = obj.details;
+    const details = rawDetails && typeof rawDetails === "object" ? rawDetails : obj;
+    const total = getNum(details, "total") ?? fallbackTotal;
+    const success = getNum(details, "success") ?? null;
+    const duplicate = getNum(details, "duplicate") ?? 0;
+    const blocked = getNum(details, "blocked") ?? 0;
+    const invalid = getNum(details, "invalid") ?? 0;
     const accounted = typeof success === "number" ? success + duplicate + blocked + invalid : null;
-    const message = typeof parsed.message === "string" ? parsed.message : "Submit response received";
+    const message = getStr(obj, "message") ?? "Submit response received";
     return {
-      parsed,
+      parsed: obj,
       message,
       total,
       success,
@@ -471,13 +480,8 @@
   function extractResponseErrorBody(response) {
     const parsed = parseJson(response.responseText);
     if (parsed && typeof parsed === "object") {
-      if (typeof parsed.error === "string") {
-        return parsed.error;
-      }
-      if (typeof parsed.message === "string") {
-        return parsed.message;
-      }
-      return JSON.stringify(parsed);
+      const obj = parsed;
+      return getStr(obj, "error") ?? getStr(obj, "message") ?? JSON.stringify(parsed);
     }
     return response.responseText || "";
   }
@@ -497,9 +501,6 @@
       return;
     }
     const urlsToSubmit = [...state.pendingUrls];
-    if (urlsToSubmit.length === 0) {
-      return;
-    }
     state.submitInFlight = true;
     logGroup(`Submitting ${urlsToSubmit.length} URLs...`, urlsToSubmit);
     try {
@@ -612,8 +613,8 @@
     }
   }
   function flushAllStorageWrites() {
-    flushPendingUrls();
-    flushMasterUrls();
+    flushSet("pending");
+    flushSet("master");
   }
   function getStatus() {
     return {
@@ -627,9 +628,8 @@
   function initState() {
     state.pendingUrls = readStringSet(CONFIG.STORAGE_KEYS.pending);
     state.masterUrls = readStringSet(CONFIG.STORAGE_KEYS.master);
-    enforceMasterListLimit();
-    if (state.masterUrls.size > 0) {
-      scheduleMasterUrlsSave();
+    if (enforceMasterListLimit()) {
+      scheduleSetSave("master");
     }
   }
   function init() {

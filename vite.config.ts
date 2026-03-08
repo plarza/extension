@@ -8,7 +8,7 @@ export default defineConfig({
 			userscript: {
 				name: "Plarza Extension",
 				namespace: "https://plarza.com",
-				version: "1.1.0",
+				version: "1.0.0",
 				description: "Scans web pages for URLs and uploads them to Plarza",
 				author: "Plarza",
 				icon: "https://plarza.com/favicon.svg",
