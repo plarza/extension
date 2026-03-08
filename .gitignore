@@ -3,8 +3,10 @@ node_modules
 
 # output
 out
-dist
 *.tgz
+
+# bun
+bun.lock
 
 # code coverage
 coverage
