@@ -600,6 +600,9 @@ async function submitUrlBatches(apiKey: string, urlsToSubmit: string[]) {
 
 	for (let index = 0; index < batches.length; index += 1) {
 		const batch = batches[index];
+		if (!batch) {
+			continue;
+		}
 		log("muted", `Submitting batch ${index + 1}/${batches.length} (${batch.length} URLs)`);
 
 		let response: Tampermonkey.Response<object>;

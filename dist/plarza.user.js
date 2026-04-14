@@ -41,7 +41,7 @@
     REQUEST_TIMEOUT_MS: 16384,
     API_KEY_PROMPT_COOLDOWN_MS: 65536,
     MASTER_LIST_MAX_SIZE: 8192,
-    PENDING_LIST_MAX_SIZE: 4096,
+    PENDING_LIST_MAX_SIZE: 8192,
     STORAGE_KEYS: Object.freeze({
       pending: "plarza_pending_urls",
       master: "plarza_submitted_urls",
@@ -522,6 +522,9 @@
     let processedUrls = 0;
     for (let index = 0; index < batches.length; index += 1) {
       const batch = batches[index];
+      if (!batch) {
+        continue;
+      }
       log("muted", `Submitting batch ${index + 1}/${batches.length} (${batch.length} URLs)`);
       let response;
       try {
