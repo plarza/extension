@@ -13,13 +13,14 @@ if ((window as any).__plarzaScraperInitialized) {
 
 const CONFIG = Object.freeze({
 	SUBMIT_URL: "https://worker.aza.network/submit",
-	BATCH_INTERVAL_MS: 10_000,
-	SCAN_DEBOUNCE_MS: 500,
-	PERSIST_DEBOUNCE_MS: 250,
-	REQUEST_TIMEOUT_MS: 15_000,
-	API_KEY_PROMPT_COOLDOWN_MS: 60_000,
-	MASTER_LIST_MAX_SIZE: 10_000,
-	PENDING_LIST_MAX_SIZE: 5_000,
+	BATCH_INTERVAL_MS: 8_192,
+	SUBMIT_BATCH_SIZE: 128,
+	SCAN_DEBOUNCE_MS: 512,
+	PERSIST_DEBOUNCE_MS: 256,
+	REQUEST_TIMEOUT_MS: 16_384,
+	API_KEY_PROMPT_COOLDOWN_MS: 65_536,
+	MASTER_LIST_MAX_SIZE: 8_192,
+	PENDING_LIST_MAX_SIZE: 8_192,
 	STORAGE_KEYS: Object.freeze({
 		pending: "plarza_pending_urls",
 		master: "plarza_submitted_urls",
@@ -562,6 +563,103 @@ function finishSubmit() {
 	state.submitInFlight = false;
 }
 
+function chunkValues<T>(values: T[], chunkSize: number): T[][] {
+	if (chunkSize <= 0) {
+		return [values];
+	}
+
+	const chunks: T[][] = [];
+	for (let start = 0; start < values.length; start += chunkSize) {
+		chunks.push(values.slice(start, start + chunkSize));
+	}
+	return chunks;
+}
+
+function sendSubmitRequest(apiKey: string, urls: string[]): Promise<Tampermonkey.Response<object>> {
+	return new Promise((resolve, reject) => {
+		GM_xmlhttpRequest({
+			method: "POST",
+			url: CONFIG.SUBMIT_URL,
+			timeout: CONFIG.REQUEST_TIMEOUT_MS,
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			},
+			data: JSON.stringify(urls),
+			onload: resolve,
+			onerror: (error) => reject(new Error(`Request failed (network error): ${String(error)}`)),
+			ontimeout: () => reject(new Error(`Request timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`)),
+			onabort: () => reject(new Error("Request aborted")),
+		});
+	});
+}
+
+async function submitUrlBatches(apiKey: string, urlsToSubmit: string[]) {
+	const batches = chunkValues(urlsToSubmit, CONFIG.SUBMIT_BATCH_SIZE);
+	let processedUrls = 0;
+
+	for (let index = 0; index < batches.length; index += 1) {
+		const batch = batches[index];
+		log("muted", `Submitting batch ${index + 1}/${batches.length} (${batch.length} URLs)`);
+
+		let response: Tampermonkey.Response<object>;
+		try {
+			response = await sendSubmitRequest(apiKey, batch);
+		} catch (error) {
+			log("error", `Batch ${index + 1}/${batches.length} failed before the server responded`, error);
+			break;
+		}
+
+		const is2xx = response.status >= 200 && response.status < 300;
+		const parsedResult = parseSubmitResult(response.responseText, batch.length);
+
+		if (!is2xx) {
+			const errorBody = extractResponseErrorBody(response);
+			log(
+				"error",
+				`Server error for batch ${index + 1}/${batches.length}: ${response.status} ${response.statusText}${errorBody ? ` | ${errorBody}` : ""}`,
+			);
+			if (response.status === 401) {
+				log("warn", "Authorization failed. Run window.plarzaResetApiKey() to update the userscript API key.");
+			}
+			break;
+		}
+
+		if (!parsedResult || !parsedResult.fullyAccounted) {
+			log(
+				"error",
+				`Server returned ${response.status} but did not fully account for batch ${index + 1}/${batches.length}; keeping ${batch.length} URLs queued for retry`,
+			);
+			if (parsedResult) {
+				log("muted", "Response summary", {
+					total: parsedResult.total,
+					success: parsedResult.success,
+					duplicate: parsedResult.duplicate,
+					blocked: parsedResult.blocked,
+					invalid: parsedResult.invalid,
+					accounted: parsedResult.accounted,
+					body: parsedResult.parsed,
+				});
+			} else if (response.responseText) {
+				log("muted", "Unparseable response body", response.responseText);
+			}
+			break;
+		}
+
+		addToMasterList(batch);
+		const removed = removeFromPendingList(batch);
+		processedUrls += removed;
+		log(
+			"success",
+			`Batch ${index + 1}/${batches.length} complete | success: ${parsedResult.success} | duplicate: ${parsedResult.duplicate} | invalid: ${parsedResult.invalid} | blocked: ${parsedResult.blocked} | removed: ${removed}`,
+		);
+	}
+
+	if (processedUrls > 0 && state.pendingUrls.size > 0) {
+		log("muted", `${state.pendingUrls.size} URL${state.pendingUrls.size === 1 ? "" : "s"} remain queued for the next submit attempt`);
+	}
+}
+
 function submitUrls() {
 	if (state.submitInFlight) {
 		return;
@@ -577,86 +675,17 @@ function submitUrls() {
 	}
 
 	const urlsToSubmit = [...state.pendingUrls];
+	const batches = chunkValues(urlsToSubmit, CONFIG.SUBMIT_BATCH_SIZE);
 	state.submitInFlight = true;
-	logGroup(`Submitting ${urlsToSubmit.length} URLs...`, urlsToSubmit);
+	logGroup(`Submitting ${urlsToSubmit.length} URLs in ${batches.length} batch${batches.length === 1 ? "" : "es"}...`, urlsToSubmit);
 
-	try {
-		GM_xmlhttpRequest({
-			method: "POST",
-			url: CONFIG.SUBMIT_URL,
-			timeout: CONFIG.REQUEST_TIMEOUT_MS,
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${apiKey}`,
-			},
-			data: JSON.stringify(urlsToSubmit),
-			onload: (response) => {
-				try {
-					const is2xx = response.status >= 200 && response.status < 300;
-					const parsedResult = parseSubmitResult(response.responseText, urlsToSubmit.length);
-
-					if (!is2xx) {
-						const errorBody = extractResponseErrorBody(response);
-						log(
-							"error",
-							`Server error: ${response.status} ${response.statusText}${errorBody ? ` | ${errorBody}` : ""}`,
-						);
-						if (response.status === 401) {
-							log("warn", "Authorization failed. Run window.plarzaResetApiKey() to update the userscript API key.");
-						}
-						return;
-					}
-
-					if (!parsedResult || !parsedResult.fullyAccounted) {
-						log(
-							"error",
-							`Server returned ${response.status} but did not fully account for the batch; keeping ${urlsToSubmit.length} URLs queued for retry`,
-						);
-						if (parsedResult) {
-							log("muted", "Response summary", {
-								total: parsedResult.total,
-								success: parsedResult.success,
-								duplicate: parsedResult.duplicate,
-								blocked: parsedResult.blocked,
-								invalid: parsedResult.invalid,
-								accounted: parsedResult.accounted,
-								body: parsedResult.parsed,
-							});
-						} else if (response.responseText) {
-							log("muted", "Unparseable response body", response.responseText);
-						}
-						return;
-					}
-
-					addToMasterList(urlsToSubmit);
-					const removed = removeFromPendingList(urlsToSubmit);
-					log(
-						"success",
-						`${parsedResult.message} | success: ${parsedResult.success} | duplicate: ${parsedResult.duplicate} | invalid: ${parsedResult.invalid} | blocked: ${parsedResult.blocked} | removed: ${removed}`,
-					);
-				} catch (error) {
-					log("error", "Unexpected error while handling submit response", error);
-				} finally {
-					finishSubmit();
-				}
-			},
-			onerror: (error) => {
-				log("error", "Request failed (network error)", error);
-				finishSubmit();
-			},
-			ontimeout: () => {
-				log("error", `Request timed out after ${CONFIG.REQUEST_TIMEOUT_MS}ms`);
-				finishSubmit();
-			},
-			onabort: () => {
-				log("error", "Request aborted");
-				finishSubmit();
-			},
+	void submitUrlBatches(apiKey, urlsToSubmit)
+		.catch((error) => {
+			log("error", "Failed to submit URL batches", error);
+		})
+		.finally(() => {
+			finishSubmit();
 		});
-	} catch (error) {
-		finishSubmit();
-		log("error", "Failed to start request", error);
-	}
 }
 
 function observePageChanges() {
