@@ -529,11 +529,11 @@ function parseSubmitResult(responseText: string, fallbackTotal: number): SubmitR
 	const rawDetails = obj.details;
 	const details = (rawDetails && typeof rawDetails === "object" ? rawDetails : obj) as Record<string, unknown>;
 
-	const total = getNum(details, "total") ?? fallbackTotal;
-	const success = getNum(details, "success") ?? null;
-	const duplicate = getNum(details, "duplicate") ?? 0;
-	const blocked = getNum(details, "blocked") ?? 0;
-	const invalid = getNum(details, "invalid") ?? 0;
+	const total = getNum(details, "urls_total") ?? fallbackTotal;
+	const success = getNum(details, "urls_success") ?? null;
+	const duplicate = getNum(details, "urls_duplicate") ?? 0;
+	const blocked = getNum(details, "urls_blocked") ?? 0;
+	const invalid = getNum(details, "urls_invalid") ?? 0;
 	const accounted = typeof success === "number" ? success + duplicate + blocked + invalid : null;
 	const message = getStr(obj, "message") ?? "Submit response received";
 
